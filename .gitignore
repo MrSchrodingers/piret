@@ -1,0 +1,19 @@
+# Build & temp artifacts
+*_extracted/
+src_recovered/
+.pytest_cache/
+.python_version.mk
+/tmp/
+*.pyc
+*.pyo
+*.dis
+*.log
+*.exe
+
+# Dependencies
+pycdc/
+pyinstxtractor/
+
+# OS
+.DS_Store
+Thumbs.db

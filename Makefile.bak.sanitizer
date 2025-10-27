@@ -1,0 +1,238 @@
+# Adaptive Reverse Engineering Makefile for PyInstaller Binaries (v5.1)
+#
+# Key Improvements:
+# - Accurate Python version parsing (e.g., 36 → 3.6, 310 → 3.10, 312 → 3.12)
+# - Dynamic main script name (no hardcoded filenames)
+# - Secure temporary file handling via mktemp
+# - .DELETE_ON_ERROR for artifact integrity
+# - Explicit environment and dependency validation
+# - Full compatibility with modern PyInstaller (v2.0–6.14.0) and Python (3.6–3.13+)
+
+.DELETE_ON_ERROR:
+
+# === Configuration ===
+TARGET_EXE      := calculo_NFSe.exe
+
+# Load persisted Python version if available
+-include .python_version.mk
+
+PYTHON_VERSION  ?= auto
+PYTHON_EXE      := python$(PYTHON_VERSION)
+
+# === Output Paths ===
+EXTRACT_DIR     := $(TARGET_EXE)_extracted
+PYZ_DIR         := $(EXTRACT_DIR)/PYZ-00.pyz_extracted
+DECOMPILED_DIR  := src_recovered
+MAIN_PYC        := $(EXTRACT_DIR)/$(basename $(TARGET_EXE)).pyc
+
+# === Toolchain ===
+PYCDC           := ./pycdc/build/pycdc
+PYCDAS          := ./pycdc/build/pycdas
+UNCOMPYLE6      := $(PYTHON_EXE) -m uncompyle6.main
+PYINSTXTRACTOR_REPO   := https://github.com/extremecoders-re/pyinstxtractor.git  
+PYINSTXTRACTOR_DIR    := pyinstxtractor
+PYINSTXTRACTOR_SCRIPT := $(PYINSTXTRACTOR_DIR)/pyinstxtractor.py
+
+# === Targets ===
+.PHONY: all clean check-env check-deps extract detect-python-version recover-source build-pycdc help
+
+all: recover-source
+
+help:
+	@echo "Adaptive Reverse Engineering Makefile for PyInstaller Binaries (v5.1)"
+	@echo "Available targets:"
+	@echo "  all                 – Run full recovery pipeline (default)"
+	@echo "  check-env           – Validate Python environment"
+	@echo "  check-deps          – Verify system dependencies (git, cmake, make, g++, xxd)"
+	@echo "  build-pycdc         – Build pycdc/pycdas decompiler suite"
+	@echo "  extract             – Extract PyInstaller archive"
+	@echo "  detect-python-version – Auto-detect or prompt for Python version"
+	@echo "  recover-source      – Decompile all extracted .pyc files"
+	@echo "  clean               – Remove all generated artifacts"
+	@echo "  help                – Show this help message"
+
+# === Dependency Checks ===
+check-deps:
+	@echo "[+] Checking system dependencies..."
+	@for cmd in git cmake make g++ xxd; do \
+		if ! command -v $$cmd &> /dev/null; then \
+			echo "[\033[0;31m!\033[0m] FATAL: '$$cmd' not found."; \
+			exit 1; \
+		fi \
+	done
+	@echo "[\033[0;32m+\033[0m] All dependencies satisfied."
+
+# === Python Version Detection ===
+detect-python-version: $(PYINSTXTRACTOR_SCRIPT)
+ifeq ($(PYTHON_VERSION),auto)
+	@echo "[i] Attempting to auto-detect Python version from binary..."
+	@rm -rf $(EXTRACT_DIR)_tmp
+	@mkdir -p $(EXTRACT_DIR)_tmp
+	@if ! python3 $(PYINSTXTRACTOR_SCRIPT) $(TARGET_EXE) > $(EXTRACT_DIR)_tmp/detect.log 2>&1; then \
+		echo "[\033[0;31m!\033[0m] Auto-detection failed."; \
+		rm -rf $(EXTRACT_DIR)_tmp; \
+		echo -n "[?] Please specify the Python version used to build this executable (e.g., 3.12, 3.13): "; \
+		read ver; \
+		echo "PYTHON_VERSION := $$ver" > .python_version.mk; \
+		echo "[\033[0;32m+\033[0m] Python version saved to .python_version.mk"; \
+		echo "[\033[0;33m~\033[0m] Please re-run 'make' to continue with Python $$ver"; \
+		exit 1; \
+	else \
+		ver=$$(grep "Python version:" $(EXTRACT_DIR)_tmp/detect.log | head -1 | awk '{print $$3}'); \
+		if [ -z "$$ver" ]; then \
+			echo "[\033[0;31m!\033[0m] Python version not found in extraction log."; \
+			echo -n "[?] Please specify the Python version (e.g., 3.12): "; \
+			read ver; \
+			echo "PYTHON_VERSION := $$ver" > .python_version.mk; \
+			echo "[\033[0;32m+\033[0m] Python version saved to .python_version.mk"; \
+			echo "[\033[0;33m~\033[0m] Please re-run 'make' to continue with Python $$ver"; \
+			exit 1; \
+		else \
+			if [ $$ver -ge 310 ]; then \
+				ver="3.$$(($$ver - 300))"; \
+			else \
+				ver="3.$$(($$ver % 10))"; \
+			fi; \
+			echo "[\033[0;32m+\033[0m] Detected Python version: $$ver"; \
+			echo "PYTHON_VERSION := $$ver" > .python_version.mk; \
+		fi; \
+		rm -rf $(EXTRACT_DIR)_tmp; \
+	fi
+else
+	@echo "[\033[0;32m+\033[0m] Using Python version: $(PYTHON_VERSION)"
+endif
+
+# === Environment Validation ===
+check-env: detect-python-version
+	@echo "[+] Validating Python environment ($(PYTHON_VERSION))..."
+	@if ! command -v $(PYTHON_EXE) &> /dev/null; then \
+		echo "[\033[0;31m!\033[0m] ERROR: '$(PYTHON_EXE)' not found in PATH."; \
+		exit 1; \
+	fi
+	@$(PYTHON_EXE) --version 2>&1 | grep -q "$(PYTHON_VERSION)" || { \
+		echo "[\033[0;31m!\033[0m] ERROR: Installed Python version does not match $(PYTHON_VERSION)."; \
+		exit 1; \
+	}
+	@echo "[\033[0;32m+\033[0m] Environment validated successfully."
+
+# === Build pycdc Decompiler Suite ===
+build-pycdc: check-deps
+	@if [ ! -d "pycdc" ]; then \
+		echo "[+] Cloning pycdc repository..."; \
+		git clone https://github.com/zrax/pycdc.git; \
+	fi
+	@mkdir -p pycdc/build
+	@cd pycdc/build && cmake .. -DCMAKE_BUILD_TYPE=Release
+	@$(MAKE) -C pycdc/build
+	@if [ ! -f "$(PYCDC)" ]; then \
+		echo "[\033[0;31m!\033[0m] Build failed: pycdc binary not found."; \
+		exit 1; \
+	fi
+	@echo "[\033[0;32m+\033[0m] pycdc and pycdas built successfully."
+
+# === Extract PyInstaller Archive ===
+$(PYINSTXTRACTOR_DIR):
+	git clone $(PYINSTXTRACTOR_REPO) $(PYINSTXTRACTOR_DIR)
+
+$(PYINSTXTRACTOR_SCRIPT): | $(PYINSTXTRACTOR_DIR)
+	chmod +x $(PYINSTXTRACTOR_SCRIPT)
+
+extract: $(TARGET_EXE) check-env $(PYINSTXTRACTOR_SCRIPT)
+	@echo "[+] Extracting PyInstaller archive: $(TARGET_EXE)"
+	@rm -rf $(EXTRACT_DIR)
+	@$(PYTHON_EXE) $(PYINSTXTRACTOR_SCRIPT) $(TARGET_EXE)
+	@if [ ! -d "$(PYZ_DIR)" ]; then \
+		echo "[\033[0;31m!\033[0m] Extraction failed: PYZ archive not found."; \
+		exit 1; \
+	fi
+	@echo "[\033[0;32m+\033[0m] Extraction completed successfully."
+
+# === Robust Source Recovery with Multi-Tool Fallback ===
+recover-source: extract build-pycdc
+	@echo "[+] Setting up decompilation workspace: $(DECOMPILED_DIR)"; \
+	mkdir -p $(DECOMPILED_DIR); \
+	$(PYTHON_EXE) -m pip install -q uncompyle6 xdis; \
+	\
+	decompile_file() { \
+		pyc="$$1"; out="$$2"; log="$$3"; dis="$$4"; \
+		echo "=== Decompilation Attempt: $$pyc ===" > "$$log"; \
+		\
+		echo "[1/4] Trying pycdc..." >> "$$log"; \
+		$(PYCDC) "$$pyc" > "$$out" 2>> "$$log" && [ -s "$$out" ] && { \
+			echo "[\033[0;32m+\033[0m] SUCCESS (pycdc): $$out"; \
+			return 0; \
+		}; \
+		echo "[!] pycdc failed." >> "$$log"; \
+		\
+		echo "[2/4] Trying uncompyle6..." >> "$$log"; \
+		$(UNCOMPYLE6) -o "$$out" "$$pyc" >> "$$log" 2>&1 && [ -s "$$out" ] && { \
+			echo "[\033[0;32m+\033[0m] SUCCESS (uncompyle6): $$out"; \
+			return 0; \
+		}; \
+		echo "[!] uncompyle6 failed." >> "$$log"; \
+		\
+		echo "[3/4] Generating disassembly (with header)..." >> "$$log"; \
+		$(PYCDAS) "$$pyc" > "$$dis" 2>> "$$log" && echo "[\033[0;33m~\033[0m] DISASSEMBLY (with header): $$dis"; \
+		\
+		echo "[4/4] Attempting raw code object extraction..." >> "$$log"; \
+		tmp_script=$$(mktemp); \
+		cat > "$$tmp_script" << 'EOF'
+	import sys, marshal
+	f = open(sys.argv[1], 'rb')
+	raw = f.read()
+	f.close()
+	for i in range(0, min(32, len(raw))):
+		try:
+			code = marshal.loads(raw[i:])
+			out = open(sys.argv[2], 'wb')
+			marshal.dump(code, out)
+			out.close()
+			print(f'[+] Code object extracted (skip={i})')
+			sys.exit(0)
+		except Exception:
+			continue
+	print('[-] Failed to extract valid code object')
+	sys.exit(1)
+EOF
+		; \
+		if $(PYTHON_EXE) "$$tmp_script" "$$pyc" /tmp/code.marshaled; then \
+			echo "[\033[0;32m+\033[0m] Raw code object extracted."; \
+			for tryver in 3.13 3.12 3.11 3.10 3.9 3.8 3.7; do \
+				echo "[Trying disassembly with Python $$tryver]..." >> "$$log"; \
+				if $(PYCDAS) -c -v $$(echo $$tryver | tr -d '.') /tmp/code.marshaled > "$${dis%.dis}_raw_$$tryver.dis" 2>> "$$log"; then \
+					echo "[\033[0;33m~\033[0m] RAW DISASSEMBLY (Python $$tryver): $${dis%.dis}_raw_$$tryver.dis"; \
+					break; \
+				fi; \
+			done; \
+		else \
+			echo "[-] Raw extraction failed." >> "$$log"; \
+		fi; \
+		rm -f "$$tmp_script" "$$out"; \
+	}; \
+	\
+	find $(PYZ_DIR) -name "*.pyc" | while read pyc; do \
+		out=$(DECOMPILED_DIR)/$$(echo "$$pyc" | sed "s|$(PYZ_DIR)/||" | sed 's|\.pyc$$|.py|'); \
+		log=$$(dirname "$$out")/$$(basename "$$out" .py).log; \
+		dis=$$(dirname "$$out")/$$(basename "$$out" .py).dis; \
+		mkdir -p "$$(dirname "$$out")"; \
+		decompile_file "$$pyc" "$$out" "$$log" "$$dis"; \
+	done; \
+	\
+	if [ -f "$(MAIN_PYC)" ]; then \
+		out=$(DECOMPILED_DIR)/$(basename $(TARGET_EXE:.exe=)).py; \
+		log=$(DECOMPILED_DIR)/$(basename $(TARGET_EXE:.exe=)).log; \
+		dis=$(DECOMPILED_DIR)/$(basename $(TARGET_EXE:.exe=)).dis; \
+		decompile_file "$(MAIN_PYC)" "$$out" "$$log" "$$dis"; \
+	else \
+		echo "[\033[0;31m!\033[0m] Main entry-point not found: $(MAIN_PYC)"; \
+	fi; \
+	\
+	echo "======================================================================"; \
+	echo "[\033[0;32m+\033[0m] REVERSE ENGINEERING PIPELINE COMPLETED."; \
+	echo "[\033[0;32m+\033[0m] Recovered source code: $(DECOMPILED_DIR)"; \
+	echo "[\033[0;33m~\033[0m] Disassembly files (.dis) available for manual analysis."; \
+	echo "======================================================================"
+
+# === Cleanup ===
+clean:
+	rm -rf $(EXTRACT_DIR) $(DECOMPILED_DIR) .python_version.mk pycdc $(PYINSTXTRACTOR_DIR) /tmp/code.marshaled
